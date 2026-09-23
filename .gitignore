@@ -1,0 +1,6 @@
+# build products
+test
+examples
+*.o
+*.s
+*.dSYM/
