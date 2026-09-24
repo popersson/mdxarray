@@ -209,12 +209,50 @@ md::dsarray<4,5> A(1.0), B(2.0);
 auto C = A + B * 3.0;                      // no heap, fully unrolled
 ```
 
+### Assigning to a name rebinds; assigning to a slice writes
+
+```cpp
+md::dview<1> v = y.page(0);
+v = y.page(1);              // v is a NAME  -> rebinds the handle, as mdspan does
+
+y.page(1) = y.page(0);      // a SLICE      -> copies the elements
+y.page(2) = some_sarray;    //               -> copies the elements
+y.page(3) = 0.0;            //               -> fills
+```
+
+The split follows from what each case can usefully mean. A slice expression
+produces a temporary, and rebinding a temporary cannot do anything observable,
+so `y.page(1) = y.page(0)` had no meaning at all before and now has the only
+useful one. A named view is a handle, and reseating it is exactly what you want
+when stepping a view along an array.
+
+`md::assign(dst, src)` still exists and is what to reach for when the
+destination is a name rather than a slice.
+
 That asymmetry is deliberate: a hidden heap allocation is impossible to write by
 accident, and expression templates become unnecessary — for static shapes the
 compiler fuses the loops anyway, and for dynamic ones no temporary is built.
 
-Note that `operator=` on a view **rebinds** the handle, matching `std::mdspan`;
-it does not copy elements. Use `md::fill` or `md::assign` for that.
+
+
+## Building small fixed-size values
+
+`sarray` is the type for short states and per-element kernels, so it constructs
+element-wise, unpacks, and accepts a matching view:
+
+```cpp
+md::dsarray<4> y{1.0, 2.0, 3.0, 4.0};      // element-wise, constexpr, count checked
+const auto [a, b, c, d] = y;               // structured bindings, rank 1 only
+
+md::dsview<4> col(&Y(0, k));
+md::dsarray<4> s = col;                    // static shape: converts implicitly
+md::dsarray<4> t(Y.page(k));               // dynamic shape: explicit, checked at run time
+auto u = col + s * 2.0;                    // a view can start an expression
+```
+
+The dynamic case is explicit on purpose: its shape is only known at run time, and
+a size mismatch should not be something an implicit conversion can hide.
+`md::compact<N>(v)` remains available and does the same thing.
 
 ## Reductions and broadcasting
 

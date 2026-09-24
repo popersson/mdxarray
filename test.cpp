@@ -8,6 +8,7 @@
 #include <vector>
 #include <map>
 #include <sstream>
+#include <tuple>
 
 static int failures = 0;
 static int checks   = 0;
@@ -35,6 +36,7 @@ static int checks   = 0;
 // compile-time checks below go through these concepts rather than being
 // written inline (where the compiler would hard-error instead of yielding false).
 template <class A> concept elem_writable  = requires(A a) { a[0,0] = 1.0; };
+template <class A> concept tuple_like    = requires { std::tuple_size<A>::value; };
 template <class A> concept paren_writable = requires(A a) { a(0,0) = 1.0; };
 template <class A> concept has_begin     = requires(A a) { a.begin(); };
 template <class A> concept plus_eq       = requires(A a) { a += 1.0; };
@@ -350,6 +352,125 @@ static void test_containers() {
   CHECK(!bool(nx));
 }
 
+// --------------------------------------------------------------------------
+// Assigning to a NAME rebinds; assigning to a SLICE writes.
+//
+// The slice case previously compiled and did nothing at all, because rebinding
+// a temporary is unobservable. These pin the split down in both directions.
+// --------------------------------------------------------------------------
+static void test_slice_assignment() {
+  darray<2> y(4, 3), z(4, 3);
+  md::fill(y, 1.0);
+  md::fill(z, 9.0);
+
+  y.page(1) = z.page(0);                 // slice = view -> writes elements
+  CHECK_EQ((y[0,1]), 9.0);
+  CHECK_EQ((y[3,1]), 9.0);
+  CHECK_EQ((y[0,0]), 1.0);               // neighbouring columns untouched
+  CHECK_EQ((y[0,2]), 1.0);
+
+  dsarray<4> s{1.0, 2.0, 3.0, 4.0};
+  y.page(2) = s;                         // slice = sarray -> writes elements
+  CHECK_EQ((y[0,2]), 1.0);
+  CHECK_EQ((y[3,2]), 4.0);
+
+  y.page(0) = 3.5;                       // slice = scalar -> fills
+  CHECK_EQ((y[0,0]), 3.5);
+  CHECK_EQ((y[3,0]), 3.5);
+
+  // a named view is a handle: assignment rebinds it, as std::mdspan does
+  dview<1> v = y.page(1);
+  v = z.page(2);
+  CHECK(v.data() == &z(0,2));
+  CHECK_EQ((y[0,1]), 9.0);               // the column v used to name is intact
+
+  // a view returned from a function is a temporary, so it writes
+  auto col = [](dview<2> a, md::index_t k) { return a.page(k); };
+  col(y, 1) = s;
+  CHECK_EQ((y[0,1]), 1.0);
+  CHECK_EQ((y[3,1]), 4.0);
+
+  // rows are strided, so assignment routes through the layout-agnostic path.
+  // That path walks the multi-index, so the source must match in rank, not
+  // merely in element count.
+  darray<3> F(5, 4, 3);
+  md::fill(F, 0.0);
+  darray<2> src(4, 3);
+  md::fill(src, 6.0);
+  F.row(2) = src;
+  CHECK_EQ((F[2,0,0]), 6.0);
+  CHECK_EQ((F[2,3,2]), 6.0);
+  CHECK_EQ((F[1,0,0]), 0.0);
+}
+
+// --------------------------------------------------------------------------
+static void test_sarray_construction() {
+  dsarray<4> a{1.0, 2.0, 3.0, 4.0};      // element-wise
+  CHECK_EQ(a(0), 1.0);
+  CHECK_EQ(a(3), 4.0);
+
+  constexpr dsarray<3> c{1.0, 2.0, 3.0}; // and it is constexpr
+  static_assert(c(2) == 3.0);
+
+  dsarray<4> f(9.0);                     // fill constructor still works
+  CHECK_EQ(f(2), 9.0);
+  md::sarray<double,1> one(5.0);         // no tie at nelem_v == 1
+  CHECK_EQ(one(0), 5.0);
+
+  md::sarray<double,2,3> m{1,2,3,4,5,6}; // layout_left order
+  CHECK_EQ(m(0,0), 1.0);
+  CHECK_EQ(m(1,0), 2.0);
+  CHECK_EQ(m(0,1), 3.0);
+
+  // a static-shaped view compacts implicitly
+  darray<2> y(4, 3);
+  md::fill(y, 2.0);
+  y(1,1) = 8.0;
+  dsview<4> sv(&y(0,1));
+  dsarray<4> fromstatic = sv;
+  CHECK_EQ(fromstatic(1), 8.0);
+  dsarray<4> sum = sv + fromstatic;      // a view can start an expression
+  CHECK_EQ(sum(1), 16.0);
+
+  // a dynamic-extent view compacts explicitly: its shape is a runtime fact
+  dsarray<4> fromdyn(y.page(1));
+  CHECK_EQ(fromdyn(1), 8.0);
+  static_assert(!std::is_convertible_v<md::view<double,1>, dsarray<4>>);
+  static_assert(std::is_constructible_v<dsarray<4>, md::view<double,1>>);
+
+  // structured bindings, rank 1 only
+  static_assert(tuple_like<dsarray<4>>);
+  static_assert(!tuple_like<md::sarray<double,2,3>>);
+  const auto [p, q, r, t] = a;
+  CHECK_EQ(p, 1.0);
+  CHECK_EQ(q, 2.0);
+  CHECK_EQ(r, 3.0);
+  CHECK_EQ(t, 4.0);
+  auto b = a;
+  auto& [b0, b1, b2, b3] = b;
+  b0 = 99.0;
+  (void)b1; (void)b2; (void)b3;
+  CHECK_EQ(b(0), 99.0);
+}
+
+// --------------------------------------------------------------------------
+static void test_static_trip_count() {
+  // assign takes its element count from whichever side knows it statically
+  static_assert(md::static_nelem<dsarray<4>>() == 4);
+  static_assert(md::static_nelem<md::sview<double,2,3>>() == 6);
+  static_assert(md::static_nelem<md::view<double,2>>() == -1);
+
+  darray<2> y(4, 3);
+  md::fill(y, 0.0);
+  dsarray<4> s{1.0, 2.0, 3.0, 4.0};
+  md::assign(y.page(1), s);              // static count from the source
+  CHECK_EQ((y[0,1]), 1.0);
+  CHECK_EQ((y[3,1]), 4.0);
+  dsarray<4> back;
+  md::assign(back, y.page(1));           // static count from the destination
+  CHECK_EQ(back(3), 4.0);
+}
+
 static void test_misc() {
   dview<3> nothing;
   darray big(2,2,2);
@@ -392,6 +513,9 @@ int main() {
   test_broadcast();
   test_compact_assign();
   test_containers();
+  test_slice_assignment();
+  test_sarray_construction();
+  test_static_trip_count();
   test_misc();
 
   if (failures) {

@@ -70,6 +70,8 @@ template <class T, index_t... E>  using sext = std::extents<index_t, E...>;
 // Read-only is expressed in the ELEMENT TYPE (view<const T,R>), not by const on
 // the view itself, exactly as for std::mdspan and for a plain T* const.
 // ===========================================================================
+template <class D, class S> constexpr void assign(D&& d, const S& s);
+
 template <class T, class Ext, class Layout = std::layout_left>
 struct basic_view : std::mdspan<T, Ext, Layout> {
   using base      = std::mdspan<T, Ext, Layout>;
@@ -85,6 +87,36 @@ struct basic_view : std::mdspan<T, Ext, Layout> {
 
   constexpr basic_view() = default;
   constexpr basic_view(const base& b) : base(b) {}
+  constexpr basic_view(const basic_view&) = default;
+
+  // ---- assignment --------------------------------------------------------
+  // Assignment is split by value category, because the two plausible meanings
+  // apply to disjoint cases:
+  //
+  //     named lvalue   A = B;              rebind the handle, as mdspan does
+  //     temporary      A.page(k) = expr;   write through to the elements
+  //
+  // A slice expression yields a temporary, and rebinding a temporary cannot do
+  // anything observable -- before this split, `A.page(k) = B.page(j)` compiled,
+  // copied nothing, and warned about nothing. So the rule is:
+  //
+  //     assigning to a NAME rebinds; assigning to a SLICE writes.
+  //
+  // Nothing that previously worked changes meaning, because the only case whose
+  // behaviour changes is the one that previously did nothing.
+  constexpr basic_view& operator=(const basic_view& o) & = default;
+
+  template <class S>
+    requires requires (const S& s) { s.data(); s.nelem(); }
+  constexpr void operator=(const S& s) && {
+    MD_ASSERT(nelem() == s.nelem(), "md: assignment shapes do not match");
+    md::assign(*this, s);
+  }
+
+  constexpr void operator=(std::type_identity_t<T> x) && {
+    T* p = data(); const index_t n = nelem();
+    for (index_t i = 0; i < n; ++i) p[i] = x;
+  }
 
   // T -> const T, never the reverse.
   template <class U>
@@ -343,7 +375,37 @@ struct sarray {
   static constexpr std::size_t rank() { return sizeof...(E); }
 
   sarray() = default;
-  explicit sarray(T x) { for (auto& e : d_) e = x; }
+  explicit constexpr sarray(T x) { for (auto& e : d_) e = x; }
+
+  // Element-wise construction: sarray<double,4>{a, b, c, d}. The argument count
+  // is checked at compile time and the constructor stays constexpr. Excluded at
+  // nelem_v == 1, where it would tie with the fill constructor above and mean
+  // the same thing anyway.
+  template <class... U>
+    requires (nelem_v > 1) && (sizeof...(U) == std::size_t(nelem_v)) &&
+             (std::convertible_to<U, T> && ...)
+  constexpr sarray(U... x) : d_{static_cast<T>(x)...} {}
+
+  // A view whose shape matches at compile time compacts implicitly. Templated
+  // on the view's element type on purpose: a parameter of sview<const T,E...>
+  // would require sview<T,...> -> sview<const T,...> -> sarray, two
+  // user-defined conversions, which the language will not perform.
+  template <class U>
+    requires std::is_same_v<std::remove_const_t<U>, T>
+  constexpr sarray(sview<U, E...> v)
+  { for (index_t i = 0; i < nelem_v; ++i) d_[i] = v.data()[i]; }
+
+  // A dynamic-extent view compacts too, but its shape is only known at run
+  // time, so this one is explicit: a size mismatch should not be something an
+  // implicit conversion can hide.
+  template <class V>
+    requires requires (const V& v) { v.data(); v.nelem(); } &&
+             std::is_same_v<std::remove_const_t<typename V::element_t>, T> &&
+             (V::extents_t::rank_dynamic() > 0)
+  explicit constexpr sarray(const V& v) {
+    MD_ASSERT(v.nelem() == nelem_v, "md::sarray: source shape does not match");
+    for (index_t i = 0; i < nelem_v; ++i) d_[i] = v.data()[i];
+  }
 
   template <class... I> constexpr T& operator[](I... i) {
     MD_ASSERT(in_bounds(static_cast<index_t>(i)...), "md: index out of bounds");
@@ -390,6 +452,16 @@ struct sarray {
   friend constexpr sarray operator*(T s, sarray a)                    { return a *= s; }
   friend constexpr sarray operator/(sarray a, T s)                    { return a /= s; }
   friend constexpr sarray operator-(sarray a) { for (auto& e : a.d_) e = -e; return a; }
+
+  // Structured bindings, for rank 1: `auto [a, b, c, d] = state;`. Deliberately
+  // not offered at higher rank, where the unpacking order would have to be
+  // memorised rather than read.
+  template <std::size_t I> requires (sizeof...(E) == 1)
+  constexpr T& get() & { static_assert(I < std::size_t(nelem_v)); return d_[I]; }
+  template <std::size_t I> requires (sizeof...(E) == 1)
+  constexpr const T& get() const& { static_assert(I < std::size_t(nelem_v)); return d_[I]; }
+  template <std::size_t I> requires (sizeof...(E) == 1)
+  constexpr T&& get() && { static_assert(I < std::size_t(nelem_v)); return std::move(d_[I]); }
 
   T d_[nelem_v];
 
@@ -451,6 +523,30 @@ template <class T> constexpr T dot4(const T* x, const T* y, index_t n) {
 }  // namespace detail
 
 template <class A> inline constexpr bool is_contiguous_v = detail::is_contiguous<A>();
+
+namespace detail {
+template <class X, std::size_t... K>
+constexpr index_t static_prod(std::index_sequence<K...>) {
+  index_t n = 1;
+  ((n *= static_cast<index_t>(X::static_extent(K))), ...);
+  return n;
+}
+}  // namespace detail
+
+// The element count as a compile-time constant when the type carries one, else
+// -1. assign() picks it up from whichever operand has static extents, so
+// copying a fixed-size sarray into a dynamic-extent slice still emits a
+// fixed-length loop rather than one whose bound has to be loaded.
+template <class A> constexpr index_t static_nelem() {
+  using P = std::remove_cvref_t<A>;
+  if constexpr (requires { P::nelem_v; }) return P::nelem_v;
+  else if constexpr (requires { typename P::extents_t; }) {
+    using X = typename P::extents_t;
+    if constexpr (X::rank_dynamic() == 0)
+      return detail::static_prod<X>(std::make_index_sequence<X::rank()>{});
+    else return -1;
+  } else return -1;
+}
 template <class A> using elem_t = std::remove_const_t<typename std::remove_cvref_t<A>::element_t>;
 
 // Walk every multi-index of `e`, first index fastest (layout_left order).
@@ -521,9 +617,15 @@ constexpr void assign(D&& d, const S& s) {
   using Dp = std::remove_cvref_t<D>;
   if constexpr (is_contiguous_v<Dp> && is_contiguous_v<S>) {
     auto* x = d.data(); const auto* y = s.data();
-    const index_t n = d.nelem();
-    MD_ASSERT(n == s.nelem(), "md::assign: shapes do not match");
-    for (index_t i = 0; i < n; ++i) x[i] = y[i];
+    MD_ASSERT(d.nelem() == s.nelem(), "md::assign: shapes do not match");
+    constexpr index_t sd = static_nelem<Dp>(), ss = static_nelem<S>();
+    constexpr index_t sn = sd > 0 ? sd : ss;
+    if constexpr (sn > 0) {
+      for (index_t i = 0; i < sn; ++i) x[i] = y[i];
+    } else {
+      const index_t n = d.nelem();
+      for (index_t i = 0; i < n; ++i) x[i] = y[i];
+    }
   } else {
     MD_ASSERT(d.nelem() == s.nelem(), "md::assign: shapes do not match");
     for_each_index(d.extents(), [&](auto... i) { d[i...] = s[i...]; });
@@ -673,6 +775,13 @@ template <index_t... E> using isview  = sview<int, E...>;
 template <index_t... E> using cisview = sview<const int, E...>;
 
 }  // namespace md
+
+// Structured-binding support for rank-1 md::sarray.
+template <class T, md::index_t N>
+struct std::tuple_size<md::sarray<T, N>>
+    : std::integral_constant<std::size_t, std::size_t(N)> {};
+template <std::size_t I, class T, md::index_t N>
+struct std::tuple_element<I, md::sarray<T, N>> { using type = T; };
 
 #endif  // __cpp_lib_mdspan
 #endif  // __has_include(<mdspan>)
