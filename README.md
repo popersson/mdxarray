@@ -328,13 +328,31 @@ need an explicit `md::fill(A, 0.0)` first.
 - Single-threaded. No GPU.
 - `double` only in `md_lapack.h`; the array types are generic.
 
+## Calling from Python and Julia
+
+`md_abi.h` is an optional header giving a self-describing C ABI for structs
+built out of mdxarray arrays, so a solver can be driven from Python or Julia
+with no binding generator — no pybind11, no nanobind, no Cython. Arrays are
+shared zero-copy in both directions.
+
+```julia
+Mesh = MDX.objtype(lib, "mesh")   # the only line that names a C++ type
+m.bbox.centre                     # [0.0, 0.5, 1.0]
+m.p                               # 5x2 Matrix{Float64}, aliasing the C++ array
+```
+
+See [interop/README.md](interop/README.md). `md.h` itself is unaffected and
+still has no dependencies.
+
 ## Layout
 
 ```
 md.h           the four types, slicing, algorithms   (no dependencies)
 md_lapack.h    optional BLAS/LAPACK shorthand        (-lblas -llapack)
+md_abi.h       optional C ABI for host-language bindings (no dependencies)
 test.cpp       self-checks, nonzero exit on failure
 examples.cpp   the use cases above, compiled
+interop/       generic Julia and Python runtimes, plus a demo
 ```
 
 Licensed under the MIT license.
