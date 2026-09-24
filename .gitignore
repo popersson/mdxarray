@@ -4,3 +4,8 @@ examples
 *.o
 *.s
 *.dSYM/
+
+# interop build products
+interop/demo/libmesh.so
+__pycache__/
+*.pyc
