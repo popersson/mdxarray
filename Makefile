@@ -2,7 +2,7 @@
 #
 # libstdc++ does not ship <mdspan> yet, so libc++ is required on Linux.
 CXX      = clang++
-CXXFLAGS = -std=c++23 -stdlib=libc++ -O2 -Wall -Wextra
+CXXFLAGS = -std=c++23 -stdlib=libc++ -O3 -march=native -Wall -Wextra
 LDLIBS   = -lblas -llapack          # only examples needs these
 
 all: test examples
