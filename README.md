@@ -29,8 +29,20 @@ templates, no hidden allocations, and no linear algebra beyond calling LAPACK.
 not ship `<mdspan>` yet, even with `-std=c++26`:
 
 ```
-clang++ -std=c++23 -stdlib=libc++ -O2 myprogram.cpp
+clang++ -std=c++23 -stdlib=libc++ -O3 -march=native myprogram.cpp
 ```
+
+`-march=native` is the flag that matters. The elementwise operations vectorize
+on their own, but the width comes from the target: 128-bit at the x86-64
+baseline, 256-bit at `-march=x86-64-v3`, 512-bit on a machine with AVX-512.
+That is a 4x spread on the same source, and it costs nothing to ask for. Use a
+specific `-march` instead if you build and run on different machines, since
+`-march=native` bakes in the build host's instruction set.
+
+`-O3` over `-O2` measured no difference for this library. It is worth knowing
+that `-O3` is fully standards-conforming and does not alter floating-point
+semantics; that is `-ffast-math`, which you do not need here and which this
+library never requires.
 
 The header emits a clear `#error` if `<mdspan>` is unavailable, rather than
 several hundred lines of template diagnostics. When libstdc++ gains `<mdspan>`,
@@ -261,11 +273,36 @@ md::sum(A)   md::dot(A,B)   md::norm(A)   md::infnorm(A)
 md::maxval(A)   md::minval(A)   md::anynan(A)
 ```
 
-These use four independent accumulators. A single-accumulator loop carries a
-floating-point dependency, and since FP addition is not associative the compiler
-may not vectorize it without `-ffast-math`; measured on an AVX2 machine, a naive
-`dot` runs at 17 GB/s against 60 GB/s unrolled and 88 GB/s for BLAS `ddot`. The
-summation order is fixed, so results stay reproducible.
+A reduction carries a floating-point dependency through its accumulator, and
+since FP addition is not associative a compiler may not reorder it. Left alone
+the obvious loop stays scalar however wide the machine is.
+
+These use `#pragma clang fp reassociate`, which lifts that restriction for the
+reduction functions only, without touching floating-point semantics anywhere
+else in your program. The compiler then picks the vector width from `-march`, so
+the same source gets 256-bit code on an AVX2 machine and 512-bit code on an
+AVX-512 one with no per-architecture tuning. Measured through `md::dot` on a
+Ryzen 9 7900X with `-march=native`:
+
+| | n = 1 000 | n = 100 000 |
+|---|---|---|
+| naive loop | 24 GB/s | 22 GB/s |
+| four accumulators | 91 GB/s | 86 GB/s |
+| **reassociated** | **250 GB/s** | **141 GB/s** |
+| OpenBLAS `ddot` | 240 GB/s | 138 GB/s |
+
+**The summation order is therefore unspecified**: it follows the vector width, so
+results can differ in the last digit or two between architectures — measured
+worst case ~1e-15 relative. This is the same bargain BLAS makes, and note that
+clang already fuses `a*b + c` into an FMA by default at every optimization
+level, so bit-identical results across builds were never on offer.
+
+Define `MD_REPRODUCIBLE_REDUCTIONS` to opt out and get a fixed four-accumulator
+order instead. Compilers other than clang fall back to it automatically.
+
+There is deliberately no BLAS dependency here: a reassociated loop matches
+OpenBLAS at large sizes and beats it at small ones, where the call cannot be
+inlined. BLAS earns its keep at level 3, which is what `md_lapack.h` wraps.
 
 Scalar functions broadcast three ways:
 

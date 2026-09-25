@@ -454,6 +454,33 @@ static void test_sarray_construction() {
 }
 
 // --------------------------------------------------------------------------
+static void test_reductions() {
+  // Reassociation changes the summation order, so reductions are checked
+  // against a tolerance rather than for bit equality -- except where the
+  // values are exactly representable, which must still be exact.
+  darray<1> x(1000);
+  for (md::index_t i = 0; i < 1000; ++i) x(i) = 1.0;
+  CHECK_EQ(md::sum(x), 1000.0);          // exact: every partial sum is exact
+  CHECK_EQ(md::dot(x, x), 1000.0);
+
+  darray<1> y(1000);
+  for (md::index_t i = 0; i < 1000; ++i) { x(i) = 1.0 / (i + 1); y(i) = 0.5; }
+  const double s = md::sum(x);
+  double ref = 0;                         // strict left-to-right reference
+  for (md::index_t i = 0; i < 1000; ++i) ref += x(i);
+  CHECK(std::abs(s - ref) <= 1e-12 * std::abs(ref));
+  CHECK(std::abs(md::dot(x, y) - 0.5 * ref) <= 1e-12 * std::abs(ref));
+  CHECK(std::abs(md::norm(x) - std::sqrt(md::dot(x, x))) <= 1e-15);
+
+  // tail handling: sizes that are not a multiple of any vector width
+  for (md::index_t n : {1, 2, 3, 5, 7, 9, 15, 17, 31, 33}) {
+    darray<1> v(n);
+    md::fill(v, 2.0);
+    CHECK_EQ(md::sum(v), 2.0 * n);
+    CHECK_EQ(md::dot(v, v), 4.0 * n);
+  }
+}
+
 static void test_static_trip_count() {
   // assign takes its element count from whichever side knows it statically
   static_assert(md::static_nelem<dsarray<4>>() == 4);
@@ -516,6 +543,7 @@ int main() {
   test_slice_assignment();
   test_sarray_construction();
   test_static_trip_count();
+  test_reductions();
   test_misc();
 
   if (failures) {
